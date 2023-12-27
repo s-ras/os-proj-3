@@ -6,13 +6,19 @@
 
 using namespace std;
 
-HANDLE threadReadWrite = CreateSemaphore(NULL, 1, 1, NULL);
-HANDLE parentPrint = CreateSemaphore(NULL, 1, 1, NULL);
-HANDLE parentDone = CreateSemaphore(NULL, 1, 1, NULL);
-HANDLE activeThreadCount = CreateSemaphore(NULL, 1, 1, NULL);
+HANDLE readerCountLock = CreateSemaphore(NULL, 1, 1, NULL);
+HANDLE writerCountLock = CreateSemaphore(NULL, 1, 1, NULL);
+HANDLE readTryLock = CreateSemaphore(NULL, 1, 1, NULL);
+HANDLE readWriteLock = CreateSemaphore(NULL, 1, 1, NULL);
+HANDLE printLock = CreateSemaphore(NULL, 0, 1, NULL);
+HANDLE parentDoneLock = CreateSemaphore(NULL, 0, 1, NULL);
+HANDLE activeThreadLock = CreateSemaphore(NULL, 1, 1, NULL);
 
 int CORE_NUMBER;
-int ACTIVE_THREAD = 0;
+int ACTIVE_THREADS = 0;
+int READERS_COUNT = 0;
+int WRITER_COUNT = 0;
+bool THREADS_DONE = false;
 
 int DATA_COUNT;
 long double* DATASET;
@@ -97,7 +103,7 @@ int main() {
 		threadParams[i] = i;
 		threadHandle[i] =
 			CreateThread(NULL, 0, calculate, &threadParams[i], 0, NULL);
-		ACTIVE_THREAD++;
+		ACTIVE_THREADS++;
 		if (!threadHandle[i]) {
 			cout << "Could not create thread, program will terminate." << endl;
 			exit(1);
@@ -105,16 +111,16 @@ int main() {
 	}
 
 	while (true) {
-		WaitForSingleObject(activeThreadCount, INFINITE);
-		if (!ACTIVE_THREAD) {
-			ReleaseSemaphore(activeThreadCount, 1, NULL);
+		WaitForSingleObject(printLock, INFINITE);
+		WaitForSingleObject(activeThreadLock, INFINITE);
+		if (THREADS_DONE) {
+			ReleaseSemaphore(activeThreadLock, 1, NULL);
 			break;
 		}
-		ReleaseSemaphore(activeThreadCount, 1, NULL);
-		WaitForSingleObject(parentPrint, INFINITE);
+		ReleaseSemaphore(activeThreadLock, 1, NULL);
 		cout << WINNER_ID << " Generated a new answer with diff = " << lastDiff
 			 << endl;
-		ReleaseSemaphore(parentDone, 1, NULL);
+		ReleaseSemaphore(parentDoneLock, 1, NULL);
 	}
 
 	for (int i = 0; i < CORE_NUMBER; i++) {
@@ -134,10 +140,10 @@ int main() {
 	delete ANSWERS;
 	delete DATASET;
 
-	CloseHandle(threadReadWrite);
-	CloseHandle(parentPrint);
-	CloseHandle(parentDone);
-	CloseHandle(activeThreadCount);
+	CloseHandle(readWriteLock);
+	CloseHandle(printLock);
+	CloseHandle(parentDoneLock);
+	CloseHandle(activeThreadLock);
 
 	return 0;
 }
@@ -219,6 +225,8 @@ DWORD WINAPI calculate(void* param) {
 		std::chrono::high_resolution_clock::now();
 	std::chrono::time_point currentTime = startTime;
 
+	long double localLastDiff = -1;
+
 	while (std::chrono::duration_cast<std::chrono::seconds>(currentTime -
 															startTime)
 			   .count() < TIME) {
@@ -247,28 +255,69 @@ DWORD WINAPI calculate(void* param) {
 
 		long double newDiff =
 			calculateDiff(newAnswers, DATASET, DATA_COUNT, OPTIMAL);
-		if (newDiff < lastDiff || lastDiff == -1) {
-			WaitForSingleObject(threadReadWrite, INFINITE);
+
+		bool isWriter = false;
+
+		if (newDiff < localLastDiff || localLastDiff == -1) {
+			localLastDiff = newDiff;
+
+			WaitForSingleObject(readTryLock, INFINITE);
+			WaitForSingleObject(readerCountLock, INFINITE);
+			READERS_COUNT++;
+			if (READERS_COUNT == 1) {
+				WaitForSingleObject(readWriteLock, INFINITE);
+			}
+			ReleaseSemaphore(readerCountLock, 1, NULL);
+			ReleaseSemaphore(readTryLock, 1, NULL);
+
+			if (newDiff < lastDiff || lastDiff == -1) {
+				isWriter = true;
+			}
+
+			WaitForSingleObject(readerCountLock, INFINITE);
+			READERS_COUNT--;
+			if (READERS_COUNT == 0) {
+				ReleaseSemaphore(readWriteLock, 1, NULL);
+			}
+			ReleaseSemaphore(readerCountLock, 1, NULL);
+		}
+
+		if (isWriter) {
+			WaitForSingleObject(writerCountLock, INFINITE);
+			WRITER_COUNT++;
+			if (WRITER_COUNT == 1) {
+				WaitForSingleObject(readTryLock, INFINITE);
+			}
+			ReleaseSemaphore(writerCountLock, 1, NULL);
+			WaitForSingleObject(readWriteLock, INFINITE);
 			if (newDiff < lastDiff || lastDiff == -1) {
 				WINNER_ID = *inp;
 				for (int i = 0; i < DATA_COUNT; i++) {
 					ANSWERS[i] = newAnswers[i];
 				}
 				lastDiff = newDiff;
-				ReleaseSemaphore(parentPrint, 1, NULL);
-				WaitForSingleObject(parentDone, INFINITE);
+				ReleaseSemaphore(printLock, 1, NULL);
+				WaitForSingleObject(parentDoneLock, INFINITE);
 			}
-			ReleaseSemaphore(threadReadWrite, 1, NULL);
+			ReleaseSemaphore(readWriteLock, 1, NULL);
+			WaitForSingleObject(writerCountLock, INFINITE);
+			WRITER_COUNT--;
+			if (WRITER_COUNT == 0) {
+				ReleaseSemaphore(readTryLock, 1, NULL);
+			}
+			ReleaseSemaphore(writerCountLock, 1, NULL);
 		}
 
 		currentTime = std::chrono::high_resolution_clock::now();
 	}
 
-	ReleaseSemaphore(parentPrint, 1, NULL);
-
-	WaitForSingleObject(activeThreadCount, INFINITE);
-	ACTIVE_THREAD--;
-	ReleaseSemaphore(activeThreadCount, 1, NULL);
+	WaitForSingleObject(activeThreadLock, INFINITE);
+	if (ACTIVE_THREADS == 1) {
+		THREADS_DONE = true;
+		ReleaseSemaphore(printLock, 1, NULL);
+	}
+	ACTIVE_THREADS--;
+	ReleaseSemaphore(activeThreadLock, 1, NULL);
 
 	return 0;
 }
